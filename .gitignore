@@ -1,0 +1,28 @@
+# Runtime outputs. Do not push ledgers.
+results/
+data/
+*.csv
+*.npz
+*.log
+*.jsonl
+
+# Internal cloud deploy (OneDrive paths, VM names)
+scripts/gcp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# OS / IDE / secrets
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.env
+*.pem
+*-key.json
