@@ -50,7 +50,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
-from tab_generators import _as_frame, _torch_seed_from_rng, gen_ctab_gan_plus, gen_tabddpm
+from tab_generators import (
+    _as_frame,
+    _torch_seed_from_rng,
+    gen_arf,
+    gen_ctab_gan_plus,
+    gen_tabddpm,
+)
 
 UAI_DATASETS = [
     "abalone",
@@ -111,6 +117,15 @@ def stable_method_seed(seed: int, dataset_key: str, method: str) -> int:
     """Return a process-independent 32-bit seed for one benchmark cell."""
     payload = f"{seed}|{dataset_key}|{method}".encode("utf-8")
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2 ** 32)
+
+
+# C1: Uniform-on-pool must share the MomentAnchor RNG stream through pool
+# construction (proposal → calibrate → filter). Only the selection law differs
+# (q = 1/B vs Frank–Wolfe). Without this alias, method-tagged seeds draw
+# independent pools and the ablation is not same-pool.
+POOL_SEED_ALIASES: dict[str, str] = {
+    "Uniform-on-pool": "MomentAnchor",
+}
 
 
 # ----------------------------------------------------------------------
@@ -853,6 +868,7 @@ def gen_momentanchor(
     use_rare_kernel: bool = False,
     use_rare_mass_constraint: bool = False,
     use_two_stage_rare: bool = False,
+    selection: str = "fw",
 ) -> tuple[np.ndarray, dict]:
     """Frank-Wolfe candidate selection with an auditable objective.
 
@@ -865,7 +881,12 @@ def gen_momentanchor(
     audit record reports the global training MMD; only the hard separation
     statement transfers without Monte Carlo error to the finite multinomial
     resample.
+
+    ``selection="uniform"`` (C1 / AE same-pool ablation) keeps the same
+    calibrated-and-filtered pool but releases with q = 1/B (no Frank--Wolfe).
     """
+    if selection not in ("fw", "uniform"):
+        raise ValueError(f"selection must be 'fw' or 'uniform', got {selection!r}")
     n, d = z.shape
     if use_two_stage_rare:
         return _gen_momentanchor_two_stage(
@@ -1027,7 +1048,8 @@ def gen_momentanchor(
         q = np.full(B, 1.0 / B)
     kq = K_pp @ q          # (B,)
     mm = Psi.T @ q         # (P,)
-    for t in range(fw_iters):
+    used_fw_iters = 0 if selection == "uniform" else int(fw_iters)
+    for t in range(used_fw_iters):
         grad = (
             2.0 * (kq - k_pt)
             + 2.0 * beta_rare * (kq - k_pr)
@@ -1090,8 +1112,9 @@ def gen_momentanchor(
         "rare_mass_attained": float(q[rare_atom].sum()) if rare_atom.any() else 0.0,
     }
     return out, {
-        "backend": "momentanchor_fw",
-        "fw_iters": fw_iters,
+        "backend": "momentanchor_fw" if selection == "fw" else "momentanchor_uniform",
+        "selection": selection,
+        "fw_iters": used_fw_iters,
         "moment_order": moment_order,
         "use_rare_kernel": bool(use_rare_kernel),
         "use_rare_mass_constraint": bool(use_rare_mass_constraint),
@@ -1118,6 +1141,15 @@ def gen_momentanchor(
     }
 
 
+def gen_momentanchor_uniform(
+    z: np.ndarray, n_syn: int, rng: np.random.Generator, **kwargs
+) -> tuple[np.ndarray, dict]:
+    """C1: same filtered pool as MomentAnchor, uniform weights q = 1/B."""
+    kwargs = dict(kwargs)
+    kwargs["selection"] = "uniform"
+    return gen_momentanchor(z, n_syn, rng, **kwargs)
+
+
 def gen_simplex_lowem(z: np.ndarray, n_syn: int, rng: np.random.Generator) -> tuple[np.ndarray, dict]:
     selection_seed, draw_seed = rng.integers(0, 2 ** 32, size=2, dtype=np.uint64)
     rho, grid = select_rho_heldout(
@@ -1138,6 +1170,85 @@ def gen_simplex_lowem(z: np.ndarray, n_syn: int, rng: np.random.Generator) -> tu
         "rho_selected": rho,
         "rho_grid": grid,
         "weight_mode": "dirichlet",
+    }
+
+
+def gen_simplex_lowem_sep(
+    z: np.ndarray,
+    n_syn: int,
+    rng: np.random.Generator,
+    *,
+    pool_factor: int = 6,
+    pool_cap: int = 4096,
+) -> tuple[np.ndarray, dict]:
+    """C2: Simplex-LOWEM under the same 2% separation protocol as MomentAnchor.
+
+    Draws a Dirichlet local-mix pool, calibrates it, then keeps only candidates
+    with d_b >= epsilon_used under the same quantile-radius relaxations and
+    one regeneration used by MomentAnchor. Releases n_syn draws uniformly from
+    the surviving pool. Weight law stays Dirichlet/nonnegative; only the
+    separation constraint is aligned with MomentAnchor.
+    """
+    selection_seed, proposal_seed, release_seed = rng.integers(
+        0, 2 ** 32, size=3, dtype=np.uint64
+    )
+    selection_rng = np.random.default_rng(selection_seed)
+    proposal_rng = np.random.default_rng(proposal_seed)
+    release_rng = np.random.default_rng(release_seed)
+    B0 = int(min(max(pool_factor * n_syn, n_syn), pool_cap))
+    need = n_syn
+    if B0 < need:
+        raise ValueError(f"pool size B0={B0} must be at least m={need}")
+    rho, grid = select_rho_heldout(
+        z, min(B0, 2 * n_syn), selection_rng, weight_mode="dirichlet"
+    )
+    pool = multiscale_simplex_draws(z, B0, proposal_rng, weight_mode="dirichlet")
+    pool = shrinkage_moment_calibration(pool, z, rho=rho)
+    radius = adaptive_separation_radius(z, q=0.02)
+    d_train = nearest_train_dist(pool, z)
+    filt = quantile_radius_filter(d_train, radius, need)
+    n_regen = 0
+    if filt is None:
+        n_regen = 1
+        pool = multiscale_simplex_draws(z, B0, proposal_rng, weight_mode="dirichlet")
+        pool = shrinkage_moment_calibration(pool, z, rho=rho)
+        d_train = nearest_train_dist(pool, z)
+        filt = quantile_radius_filter(d_train, radius, need)
+        if filt is None:
+            raise SeparationFailure(
+                f"Simplex-LOWEM-Sep: fewer than m={need} candidates survive the relaxed radius"
+            )
+    keep, used_radius, n_relax = filt
+    pool = pool[keep]
+    d_train = d_train[keep]
+    if float(d_train.min()) <= 0.0 and used_radius <= 0.0:
+        # Match MomentAnchor release check when the radius is zero.
+        pos = d_train > 0.0
+        if pos.sum() < need:
+            raise SeparationFailure(
+                "Simplex-LOWEM-Sep: active candidates include training copies and too few positives remain"
+            )
+        pool = pool[pos]
+        d_train = d_train[pos]
+    draw = release_rng.choice(len(pool), size=n_syn, replace=True)
+    out = pool[draw]
+    d_sep = float(d_train.min())
+    return out, {
+        "backend": "simplex_lowem_sep",
+        "rho_selected": rho,
+        "rho_grid": grid,
+        "weight_mode": "dirichlet",
+        "pool_size": int(len(pool)),
+        "separation_radius_requested": radius,
+        "separation_radius_used": used_radius,
+        "separation_relaxations": int(n_relax),
+        "pool_regenerations": int(n_regen),
+        "d_sep": d_sep,
+        "audit_record": {
+            "d_sep": d_sep,
+            "U_train": float("nan"),
+            "r_mom": float("nan"),
+        },
     }
 
 
@@ -1262,8 +1373,17 @@ GENERATORS: dict[str, Callable] = {
     "TVAE": gen_tvae,
 }
 
+# TKDE AE / mean-review gap methods (C1, C2, H2). Not mixed into --profile full
+# until Nathaniel clears the ledger for the manuscript.
+GAP_GENERATORS: dict[str, Callable] = {
+    "Uniform-on-pool": gen_momentanchor_uniform,
+    "Simplex-LOWEM-Sep": gen_simplex_lowem_sep,
+    "TabDDPM": gen_tabddpm,
+    "ARF": gen_arf,
+}
+
 # Experimental approximations used only for explicit smoke studies. These are
-# not official implementations and never enter submission tables.
+# not official implementations and never enter submission tables by default.
 EXPERIMENTAL_GENERATORS: dict[str, Callable] = {
     "TabDDPM-style": gen_tabddpm,
     "CTAB-GAN+-style": gen_ctab_gan_plus,
@@ -1408,6 +1528,7 @@ def run_benchmark(
                     log(f"  [SKIP] {method}")
                     continue
                 seed_key = method.split(" (", 1)[0]
+                seed_key = POOL_SEED_ALIASES.get(seed_key, seed_key)
                 m_rng = np.random.default_rng(stable_method_seed(seed, key, seed_key))
                 t_m = time.time()
                 try:

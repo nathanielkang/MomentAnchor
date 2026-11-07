@@ -7,6 +7,11 @@ smoke : 1 dataset (abalone), 1 seed, 256 synthetic samples (~2 min sanity run)
 full  : 12 datasets, 5 seeds, 1024 synthetic samples per method per dataset
 new_baselines_smoke : abalone, seed 42, n_synthetic=256, TabDDPM + CTAB-GAN+ only
 extra6 : screened six-candidate replay (not the locked roster)
+tkde_gaps : C1 Uniform-on-pool + C2 Simplex-LOWEM-Sep + legacy TabDDPM stub
+            plus MomentAnchor and Simplex-LOWEM on the locked roster.
+            Writes results/tkde_c1c2h2_*.csv (does not overwrite benchmark_raw).
+tkde_h2_arf : H2 stronger post-2021 row = ARF (arfpy) + MomentAnchor on the
+            locked roster. Writes results/tkde_h2_arf_*.csv.
 
 Ablations
 ---------
@@ -16,6 +21,7 @@ Examples
 --------
 python scripts/run_benchmark.py --profile smoke
 python scripts/run_benchmark.py --profile full
+python scripts/run_benchmark.py --profile tkde_gaps
 python scripts/run_benchmark.py --profile new_baselines_smoke
 python scripts/run_benchmark.py --methods TabDDPM "CTAB-GAN+" --datasets abalone
 python scripts/run_benchmark.py --ablation fw --seeds 42 43 44
@@ -32,9 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lowem_bench as lb
 from tab_generators import (
+    FULL_EPOCHS_TABDDPM,
+    FULL_STEPS_TABDDPM,
     SMOKE_EPOCHS_CTAB,
     SMOKE_EPOCHS_TABDDPM,
     SMOKE_STEPS_TABDDPM,
+    gen_arf,
     gen_ctab_gan_plus,
     gen_tabddpm,
 )
@@ -60,7 +69,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--profile",
-        choices=["smoke", "full", "new_baselines_smoke", "extra6", "screen6"],
+        choices=[
+            "smoke",
+            "full",
+            "new_baselines_smoke",
+            "extra6",
+            "screen6",
+            "tkde_gaps",
+            "tkde_gaps_smoke",
+            "tkde_h2_arf",
+            "tkde_h2_arf_smoke",
+        ],
         default=None,
     )
     parser.add_argument("--ablation", choices=["fw"], default=None)
@@ -110,6 +129,58 @@ def main() -> int:
         seeds = args.seeds or [42]
         n_syn = args.n_synthetic or 256
         run_name = "new_baselines_smoke"
+    elif args.profile == "tkde_gaps_smoke":
+        # Local / remote smoke for C1+C2+H2 before the full 12×5 campaign.
+        methods = {
+            "MomentAnchor": lb.gen_momentanchor,
+            "Uniform-on-pool": lb.gen_momentanchor_uniform,
+            "Simplex-LOWEM": lb.gen_simplex_lowem,
+            "Simplex-LOWEM-Sep": lb.gen_simplex_lowem_sep,
+            "TabDDPM": partial(
+                gen_tabddpm,
+                epochs=SMOKE_EPOCHS_TABDDPM,
+                n_timesteps=SMOKE_STEPS_TABDDPM,
+            ),
+        }
+        datasets = args.datasets or ["abalone"]
+        seeds = args.seeds or [42]
+        n_syn = args.n_synthetic or 256
+        run_name = "tkde_c1c2h2_smoke"
+    elif args.profile == "tkde_gaps":
+        methods = {
+            "MomentAnchor": lb.gen_momentanchor,
+            "Uniform-on-pool": lb.gen_momentanchor_uniform,
+            "Simplex-LOWEM": lb.gen_simplex_lowem,
+            "Simplex-LOWEM-Sep": lb.gen_simplex_lowem_sep,
+            "TabDDPM": partial(
+                gen_tabddpm,
+                epochs=FULL_EPOCHS_TABDDPM,
+                n_timesteps=FULL_STEPS_TABDDPM,
+            ),
+        }
+        datasets = args.datasets or lb.UAI_DATASETS
+        seeds = args.seeds or [42, 43, 44, 45, 46]
+        n_syn = args.n_synthetic or 1024
+        run_name = "tkde_c1c2h2"
+    elif args.profile == "tkde_h2_arf_smoke":
+        methods = {
+            "MomentAnchor": lb.gen_momentanchor,
+            "ARF": gen_arf,
+        }
+        datasets = args.datasets or ["abalone"]
+        seeds = args.seeds or [42]
+        n_syn = args.n_synthetic or 256
+        run_name = "tkde_h2_arf_smoke"
+    elif args.profile == "tkde_h2_arf":
+        # H2 swap: ARF (AISTATS 2023) replaces the continuous-only TabDDPM stub.
+        methods = {
+            "MomentAnchor": lb.gen_momentanchor,
+            "ARF": gen_arf,
+        }
+        datasets = args.datasets or lb.UAI_DATASETS
+        seeds = args.seeds or [42, 43, 44, 45, 46]
+        n_syn = args.n_synthetic or 1024
+        run_name = "tkde_h2_arf"
     elif args.profile == "smoke":
         methods = dict(lb.GENERATORS)
         methods.update(_new_baseline_generators())
@@ -125,9 +196,17 @@ def main() -> int:
         run_name = "benchmark"
 
     if args.methods:
-        pool = methods if args.profile == "new_baselines_smoke" else lb.GENERATORS
-        if args.profile != "new_baselines_smoke":
+        pool = {**lb.GENERATORS, **lb.GAP_GENERATORS, **lb.EXPERIMENTAL_GENERATORS}
+        if args.profile not in (
+            "new_baselines_smoke",
+            "tkde_gaps",
+            "tkde_gaps_smoke",
+            "tkde_h2_arf",
+            "tkde_h2_arf_smoke",
+        ):
             methods = dict(lb.GENERATORS)
+            methods.update(lb.GAP_GENERATORS)
+        methods = {m: (methods.get(m) or pool[m]) for m in args.methods if m in pool or m in methods}
         methods = {m: methods[m] for m in args.methods if m in methods}
         if not methods:
             known = sorted(pool.keys())

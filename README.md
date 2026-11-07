@@ -62,6 +62,15 @@ Frank–Wolfe iteration and moment-order ablations:
 python scripts/run_benchmark.py --ablation fw --seeds 42 43 44
 ```
 
+Same-pool uniform weights (selection ablation) and a post-2021 ARF row:
+
+```bash
+python scripts/run_benchmark.py --profile tkde_gaps_smoke
+python scripts/run_benchmark.py --profile tkde_h2_arf_smoke
+```
+
+`numpy<2` is required for `arfpy`. Full roster drivers use `--profile tkde_gaps` and `--profile tkde_h2_arf`.
+
 ```bash
 python scripts/run_benchmark.py --help
 ```
@@ -80,5 +89,6 @@ requirements.txt   Python dependencies
 
 - The distance filter uses the 2% leave-one-out nearest-neighbor quantile on the training sample. That quantile can be 0.
 - A post-fit check refuses a release if the fitted law places weight on a copy of a training row.
-- Tabular diffusion was exercised only in preliminary smoke runs and is not in the printed tables.
+- `Uniform-on-pool` shares the MomentAnchor pool RNG through filtering; only the selection weights change.
+- `ARF` is the Adversarial Random Forests synthesizer via `arfpy` (optional post-2021 trained baseline).
 - `Simplex-LOWEM` is a lineage ablation, not a published baseline.

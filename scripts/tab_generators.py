@@ -370,7 +370,67 @@ def smoke_ctab_partial(epochs: int = SMOKE_EPOCHS_CTAB):
     return partial(gen_ctab_gan_plus, epochs=epochs)
 
 
+def gen_arf(
+    z: np.ndarray,
+    n_syn: int,
+    rng: np.random.Generator,
+    *,
+    num_trees: int = 30,
+    max_iters: int = 10,
+    min_node_size: int = 5,
+) -> tuple[np.ndarray, dict]:
+    """Adversarial Random Forests synthesizer (Watson et al., AISTATS 2023).
+
+    Uses the maintained ``arfpy`` package (Blesch & Wright, 2023). CPU-native
+    and stronger than the pack's continuous-only TabDDPM stub for mixed tabular
+    structure. Requires ``numpy<2`` (arfpy uses ``np.in1d``).
+    """
+    try:
+        import numpy as _np
+
+        # arfpy 0.1.x still calls np.in1d (removed in NumPy 2).
+        if not hasattr(_np, "in1d"):
+            _np.in1d = _np.isin  # type: ignore[attr-defined]
+
+        from arfpy import arf as arf_mod
+
+        seed = int(rng.integers(0, 2**31 - 1))
+        _np.random.seed(seed)
+        df = _as_frame(z)
+        model = arf_mod.arf(
+            x=df,
+            num_trees=num_trees,
+            max_iters=max_iters,
+            min_node_size=min_node_size,
+            verbose=False,
+            early_stop=True,
+        )
+        model.forde()
+        out_df = model.forge(n=int(n_syn))
+        out = out_df.to_numpy(dtype=np.float64)
+        if out.shape != (n_syn, z.shape[1]):
+            raise RuntimeError(f"ARF forge shape {out.shape}, expected {(n_syn, z.shape[1])}")
+        lo = np.quantile(z, 0.001, axis=0)
+        hi = np.quantile(z, 0.999, axis=0)
+        out = np.clip(out, lo, hi)
+        return out, {
+            "backend": "arfpy",
+            "num_trees": num_trees,
+            "max_iters": max_iters,
+            "min_node_size": min_node_size,
+            "seed": seed,
+            "note": "Adversarial Random Forests (Watson et al., AISTATS 2023) via arfpy",
+        }
+    except Exception as exc:
+        return z[rng.choice(len(z), size=n_syn, replace=True)].copy(), {
+            "backend": "arfpy",
+            "error": str(exc),
+            "fallback": "bootstrap_rows",
+        }
+
+
 GENERATOR_EXPORTS: dict[str, Callable] = {
     "TabDDPM": gen_tabddpm,
     "CTAB-GAN+": gen_ctab_gan_plus,
+    "ARF": gen_arf,
 }
